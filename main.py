@@ -8,31 +8,22 @@ from pathlib import Path
 # =====================================================
 # 1. DATA LOADING & ANALYSIS
 # =====================================================
-def convert_dataset_to_json():
-    BASE_DIR = Path(__file__).resolve().parent
-    excel_path = BASE_DIR / "data" / "dataset" / "trainset_40k_onlySent.xlsx"
-    
-    print("Loading ....")
-    df = pd.read_excel(excel_path)
-    
-    jsonl_path = BASE_DIR / "data" / "dataset" / "parsmap_dataset.jsonl"
-    df.to_json(jsonl_path, orient="records", lines=True, force_ascii=False)
-    print(f"\njsonlfile create in: {jsonl_path}")
-
-
 def loading_dataset(dataset_path):
     """
-    This function loads a JSONL file using the Hugging Face library.
+    Reads an Excel file and converts it directly to a Hugging Face DatasetDict.
     """
-
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"File path not found: {dataset_path}")
-    
-    print(f"Loading dataset from: {dataset_path}")
-    dataset = load_dataset("json", data_files=dataset_path, split="train")
-    print(f"Dataset loaded successfully. Number of rows: {len(dataset)}")
 
-    return dataset
+    print(f"Loading Excel file from: {dataset_path}")
+    
+    df = pd.read_excel(dataset_path)
+    hf_dataset = Dataset.from_pandas(df, preserve_index=False)
+    dataset_dict = DatasetDict({"train": hf_dataset})
+
+    print(f"Dataset loaded successfully as DatasetDict. Number of rows: {len(dataset_dict['train']):,}")
+    
+    return dataset_dict
 
 
 def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
@@ -157,35 +148,68 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
 
     print(f"\n{line}\nAnalysis finished.\n{line}")
 
+
 # =====================================================
 # 2. DATA PREPROCESS
 # =====================================================
-def clean_jsonl_dataset(input_path):
+def clean_dataset(dataset_dict):
     """
-    Reads a JSONL file, removes exact duplicate rows, and saves it to a new JSONL file.
+    Takes a DatasetDict, removes exact duplicate rows from all splits,
     """
-    output_path = "data/dataset/parsmap_clean_dataset.jsonl"
-    print(f"Loading dataset from: {input_path}")
+    print("\n--- Removing Duplicates ---")
     
-    df = pd.read_json(input_path, lines=True)
-    initial_len = len(df)
-    
-    df_cleaned = df.drop_duplicates()
-    final_len = len(df_cleaned)
-    
-    removed_count = initial_len - final_len
-    print(f"Removed {removed_count} exact duplicate rows.")
-    print(f"Dataset size changed from {initial_len:,} to {final_len:,} rows.")
-    
-    df_cleaned.to_json(output_path, orient="records", lines=True, force_ascii=False)
-    print(f"Cleaned dataset saved successfully to: {output_path}")
+    if not isinstance(dataset_dict, DatasetDict):
+        raise TypeError("Input must be a Hugging Face DatasetDict.")
 
-    return df_cleaned
+    cleaned_dict = {}
+
+    for split_name, split_data in dataset_dict.items():
+        print(f"Processing split: '{split_name}'")
+        
+        df = split_data.to_pandas()
+        initial_len = len(df)
+        
+        df_cleaned = df.drop_duplicates()
+        final_len = len(df_cleaned)
+        
+        removed_count = initial_len - final_len
+        print(f"    - Removed {removed_count} exact duplicate rows. (Size: {initial_len:,} -> {final_len:,})")
+        
+        clean_split = Dataset.from_pandas(df_cleaned, preserve_index=False)
+        cleaned_dict[split_name] = clean_split
+
+    return DatasetDict(cleaned_dict)
+
+
+def split_dataset(dataset_dict, val_size=0.1, seed=42):
+    """
+    Takes a DatasetDict, extracts the 'train' split, splits it into 
+    train and validation sets, and returns the two Dataset objects.
+    """
+    print("\n--- Splitting Dataset ---")
+    
+    if "train" not in dataset_dict:
+        raise ValueError("DatasetDict must contain a 'train' split.")
+    
+    raw_train = dataset_dict["train"]
+    total_rows = len(raw_train)
+    
+    split_data = raw_train.train_test_split(test_size=val_size, seed=seed)
+    
+    train_data = split_data["train"]
+    val_data = split_data["test"]
+    
+    print(f"Split complete:")
+    print(f"    - Train rows: {len(train_data):,} ({100 * len(train_data)/total_rows:.1f}%)")
+    print(f"    - Validation rows: {len(val_data):,} ({100 * len(val_data)/total_rows:.1f}%)")
+    
+    return train_data, val_data
+
 
 if __name__ == "__main__":
     # ==================== CONFIGURATION ====================
     MODEL_NAME="google/gemma-3-4b-it"
-    DATASET_PATH = "data/dataset/parsmap_dataset.jsonl"
+    DATASET_PATH = "data/dataset/trainset_40k_onlySent.xlsx"
 
     # ==================== STEP 1: LOAD RAW DATA ====================
     # convert_dataset_to_json()
@@ -193,5 +217,5 @@ if __name__ == "__main__":
     # dataset_first_look(raw_dataset)
 
     # ==================== STEP 2: PREPARE DATA ====================
-    clean_dataset=clean_jsonl_dataset(DATASET_PATH)
-
+    clean_dataset=clean_dataset(raw_dataset)
+    train_dataset,valid_dataset=split_dataset(clean_dataset)
