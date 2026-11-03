@@ -4,6 +4,7 @@ from datasets import Dataset, load_dataset, DatasetDict
 from collections import Counter
 import os
 from pathlib import Path
+from transformers import  AutoTokenizer, AutoModelForCausalLM
 
 # =====================================================
 # 1. DATA LOADING & ANALYSIS
@@ -205,6 +206,54 @@ def split_dataset(dataset_dict, val_size=0.1, seed=42):
     
     return train_data, val_data
 
+# =====================================================
+# 3. MODEL LOADING & QLORA SETUP
+# =====================================================
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+def load_model_and_tokenizer(model_name):
+    print(f"Loading model: {model_name} in 4-bit...")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map="auto",
+        attn_implementation="eager" 
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right" 
+
+    model = prepare_model_for_kbit_training(model)
+
+    peft_config = LoraConfig(
+        r=16,                       
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+
+
+    model = get_peft_model(model, peft_config)
+    
+    print("✅ Model loaded and prepared for QLoRA fine-tuning!")
+    model.print_trainable_parameters() 
+
+    return model, tokenizer
+
 
 if __name__ == "__main__":
     # ==================== CONFIGURATION ====================
@@ -219,3 +268,6 @@ if __name__ == "__main__":
     # ==================== STEP 2: PREPARE DATA ====================
     clean_dataset=clean_dataset(raw_dataset)
     train_dataset,valid_dataset=split_dataset(clean_dataset)
+
+    # ==================== STEP 3: LOAD MODEL ====================
+    base_model,base_tokenizer=load_model_and_tokenizer(MODEL_NAME)
