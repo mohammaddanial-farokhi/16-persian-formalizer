@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 from transformers import  AutoTokenizer, AutoModelForCausalLM
 from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
+from unsloth.chat_templates import get_chat_template,train_on_responses_only
 import torch
+from trl import SFTConfig,SFTTrainer
+from transformers.trainer_utils import get_last_checkpoint
 
 # =====================================================
 # 1. DATA LOADING & ANALYSIS
@@ -213,7 +215,7 @@ def split_dataset(dataset_dict, val_size=0.1, seed=42):
 # =====================================================
 # 3. MODEL LOADING & QLORA SETUP
 # =====================================================
-def load_model_and_tokenizer(model_name, max_seq_length=1024):
+def load_model_and_tokenizer(model_name, max_seq_length=512):
     """
     Loads a model using Unsloth for fast QLoRA fine-tuning.
     """
@@ -224,7 +226,8 @@ def load_model_and_tokenizer(model_name, max_seq_length=1024):
         model_name=model_name,
         max_seq_length=max_seq_length, 
         dtype=torch.bfloat16,           
-        load_in_4bit=True,             
+        load_in_4bit=True, 
+        local_files_only=True,            
     )
 
 
@@ -290,9 +293,87 @@ def prepare_dataset_for_training(dataset, tokenizer):
     return formatted_dataset, tokenizer
 
 
+# =====================================================
+# 5. TRAIN
+# =====================================================
+def start_training(model, tokenizer, train_dataset, valid_dataset):
+    print("\n--- Starting Fine-Tuning (Optimized with Unsloth) ---")
+    
+    # 1. Define paths
+    checkpoint_dir = "data/model/checkpoints"
+    final_model_dir = "data/model/final_model"
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(final_model_dir, exist_ok=True)
+
+    # 2. Check for existing checkpoints
+    last_checkpoint = None
+    if os.path.exists(checkpoint_dir):
+        last_checkpoint = get_last_checkpoint(checkpoint_dir)
+        
+    if last_checkpoint is not None:
+        print(f"Found previous checkpoint! Resuming from: {last_checkpoint}")
+    else:
+        print("No checkpoint found. Starting from scratch.")
+
+    # 3. Optimized configuration for RTX 4060 8GB + Unsloth
+    training_args = SFTConfig(
+        output_dir=checkpoint_dir,
+        dataset_text_field="text",
+        max_seq_length=512,                 # Sentences are short, no need for a larger number
+        per_device_train_batch_size=2,      # Since we use train_on_responses_only, we can set batch size to 2 (change to 1 if OOM occurs)
+        gradient_accumulation_steps=4,      # Equivalent to batch size 8
+        warmup_steps=10,
+        num_train_epochs=3,
+        learning_rate=2e-4,
+        fp16=False,
+        bf16=True,                          # RTX 4060 supports this
+        logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=1500,
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=3,                 # Exactly as requested: keep only 3 checkpoints
+        optim="adamw_8bit",                 # 8-bit optimizer to save memory
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407,
+        report_to="none",
+        packing=False,                      # For this dataset, it's better to disable packing
+    )
+
+    # 4. Create SFTTrainer
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
+        args=training_args,
+    )
+
+    # 5. Unsloth magic: train only on responses
+    # This tells the model to only learn the text after <start_of_turn>model
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part="<start_of_turn>user\n",
+        response_part="<start_of_turn>model\n",
+    )
+
+    # 6. Start training (with Resume capability)
+    print("\nTraining started... Check your terminal for loss updates.")
+    trainer.train(resume_from_checkpoint=last_checkpoint)
+    
+    # 7. Save the final model
+    print("\n--- Saving Final Model ---")
+    model.save_pretrained(final_model_dir)
+    tokenizer.save_pretrained(final_model_dir)
+    print(f"✅ Final model saved successfully to: {final_model_dir}")
+
+    return model, tokenizer
+
 if __name__ == "__main__":
     # ==================== CONFIGURATION ====================
-    MODEL_NAME="google/gemma-3-4b-it"
+    MODEL_NAME="unsloth/gemma-3-4b-it-unsloth-bnb-4bit" 
     DATASET_PATH = "data/dataset/trainset_40k_onlySent.xlsx"
 
     # ==================== STEP 1: LOAD RAW DATA ====================
@@ -301,8 +382,8 @@ if __name__ == "__main__":
     # dataset_first_look(raw_dataset)
 
     # ==================== STEP 2: PREPARE DATA ====================
-    clean_dataset=clean_dataset(raw_dataset)
-    train_dataset,valid_dataset=split_dataset(clean_dataset)
+    cleaned_dataset =clean_dataset(raw_dataset)
+    train_dataset,valid_dataset=split_dataset(cleaned_dataset)
 
     # ==================== STEP 3: LOAD MODEL ====================
     base_model,base_tokenizer=load_model_and_tokenizer(MODEL_NAME)
@@ -310,3 +391,6 @@ if __name__ == "__main__":
     # ==================== STEP 4: PRE-TRAIN ====================
     train_dataset_formatted, formatted_tokenizer=prepare_dataset_for_training(train_dataset, base_tokenizer)
     valid_dataset_formatted, _ = prepare_dataset_for_training(valid_dataset, base_tokenizer)
+
+    # ==================== STEP 5: TRAIN ====================
+    SFT_model,SFT_tokenizer=start_training(base_model, base_tokenizer, train_dataset_formatted, valid_dataset_formatted,)
