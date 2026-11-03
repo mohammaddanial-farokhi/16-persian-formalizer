@@ -1,3 +1,4 @@
+import unsloth
 import pandas as pd
 import numpy as np
 from datasets import Dataset, load_dataset, DatasetDict
@@ -5,6 +6,9 @@ from collections import Counter
 import os
 from pathlib import Path
 from transformers import  AutoTokenizer, AutoModelForCausalLM
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template
+import torch
 
 # =====================================================
 # 1. DATA LOADING & ANALYSIS
@@ -209,50 +213,81 @@ def split_dataset(dataset_dict, val_size=0.1, seed=42):
 # =====================================================
 # 3. MODEL LOADING & QLORA SETUP
 # =====================================================
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+def load_model_and_tokenizer(model_name, max_seq_length=1024):
+    """
+    Loads a model using Unsloth for fast QLoRA fine-tuning.
+    """
+    print(f"Loading model with Unsloth: {model_name}")
 
-def load_model_and_tokenizer(model_name):
-    print(f"Loading model: {model_name} in 4-bit...")
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length, 
+        dtype=torch.bfloat16,           
+        load_in_4bit=True,             
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        attn_implementation="eager" 
-    )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right" 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    model = prepare_model_for_kbit_training(model)
 
-    peft_config = LoraConfig(
-        r=16,                       
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16, # رنک LoRA
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=32,
-        lora_dropout=0.05,
+        lora_dropout=0.0, 
         bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        use_gradient_checkpointing="unsloth", 
+        random_state=3407,
+        use_rslora=False,
+        loftq_config=None,
     )
-
-
-    model = get_peft_model(model, peft_config)
     
-    print("✅ Model loaded and prepared for QLoRA fine-tuning!")
+    print("✅ Model loaded with Unsloth and ready for QLoRA!")
     model.print_trainable_parameters() 
 
     return model, tokenizer
+
+
+# =====================================================
+# 4. MODEL PRE-TRAIN
+# =====================================================
+def prepare_dataset_for_training(dataset, tokenizer):
+    """
+    Formats the dataset into a conversation structure and applies the Gemma 3 chat template.
+    """
+    print("\n--- Preparing Dataset for Training ---")
+    
+    tokenizer = get_chat_template(
+        tokenizer,
+        chat_template="gemma-3",
+    )
+
+    def format_prompts(examples):
+        texts = []
+        for informal, formal in zip(examples['inFormalForm'], examples['formalForm']):
+            messages = [
+                {"role": "user", "content": f"متن محاوره‌ای زیر را به متن رسمی تبدیل کن:\n{informal}"},
+                {"role": "assistant", "content": formal}
+            ]
+            
+            text = tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+            texts.append(text)
+            
+        return {"text": texts}
+    
+
+    formatted_dataset = dataset.map(format_prompts, batched=True)
+    print("Dataset formatted successfully!")
+    
+    return formatted_dataset, tokenizer
 
 
 if __name__ == "__main__":
@@ -271,3 +306,7 @@ if __name__ == "__main__":
 
     # ==================== STEP 3: LOAD MODEL ====================
     base_model,base_tokenizer=load_model_and_tokenizer(MODEL_NAME)
+
+    # ==================== STEP 4: PRE-TRAIN ====================
+    train_dataset_formatted, formatted_tokenizer=prepare_dataset_for_training(train_dataset, base_tokenizer)
+    valid_dataset_formatted, _ = prepare_dataset_for_training(valid_dataset, base_tokenizer)
