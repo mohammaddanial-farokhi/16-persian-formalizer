@@ -1,9 +1,12 @@
 import unsloth
+import os
+os.environ["UNSLOTH_MOE_DISABLE_AUTOTUNE"] = "1"
+
+import random
 import pandas as pd
 import numpy as np
 from datasets import Dataset, load_dataset, DatasetDict
 from collections import Counter
-import os
 from pathlib import Path
 from transformers import  AutoTokenizer, AutoModelForCausalLM
 from unsloth import FastLanguageModel
@@ -11,6 +14,11 @@ from unsloth.chat_templates import get_chat_template,train_on_responses_only
 import torch
 from trl import SFTConfig,SFTTrainer
 from transformers.trainer_utils import get_last_checkpoint
+import gc
+import torch
+import unsloth
+from tqdm import tqdm
+import evaluate
 
 # =====================================================
 # 1. DATA LOADING & ANALYSIS
@@ -320,15 +328,17 @@ def start_training(model, tokenizer, train_dataset, valid_dataset):
     training_args = SFTConfig(
         output_dir=checkpoint_dir,
         dataset_text_field="text",
-        max_seq_length=512,                 # Sentences are short, no need for a larger number
+        max_seq_length=256,                 # Sentences are short, no need for a larger number
         per_device_train_batch_size=2,      # Since we use train_on_responses_only, we can set batch size to 2 (change to 1 if OOM occurs)
-        gradient_accumulation_steps=4,      # Equivalent to batch size 8
+        gradient_accumulation_steps=5,      # Equivalent to batch size 8
+        per_device_eval_batch_size=1,       # <--- این خط را اضافه کنید (در هر لحظه 1 داده در ارزیابی)
+        eval_accumulation_steps=4,          # <--- برای انتقال تدریجی نتایج به رم
         warmup_steps=10,
-        num_train_epochs=3,
+        num_train_epochs=2,
         learning_rate=2e-4,
         fp16=False,
         bf16=True,                          # RTX 4060 supports this
-        logging_steps=10,
+        logging_steps=100,
         eval_strategy="steps",
         eval_steps=1500,
         save_strategy="steps",
@@ -371,26 +381,206 @@ def start_training(model, tokenizer, train_dataset, valid_dataset):
 
     return model, tokenizer
 
+
+# =====================================================
+# 6. EVALUATION
+# =====================================================
+def create_evaluation_dataset(model, tokenizer, valid_dataset, num_samples=2000, batch_size=16):
+    """
+    Optimized function to generate predictions in batches for much faster inference.
+    """
+    csv_path = "data/dataset/evaluation_dataset.csv"
+
+    if os.path.exists(csv_path):
+        print(f"\n✅ Found existing dataset at '{csv_path}'. Loading it...")
+        return pd.read_csv(csv_path)
+
+    print(f"\n--- Generating Predictions for {num_samples} samples (Batch Size: {batch_size}) ---")
+    
+    FastLanguageModel.for_inference(model)
+    
+    # IMPORTANT: For batched generation, tokenizer must pad on the left
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    eval_data = {
+        "informal_text": [],
+        "target_formal_text": [],
+        "predicted_formal_text": []
+    }
+    
+    subset = valid_dataset.select(range(min(num_samples, len(valid_dataset))))
+    
+    # Process in batches
+    for i in tqdm(range(0, len(subset), batch_size), desc="Processing batches"):
+        batch_samples = subset.select(range(i, min(i + batch_size, len(subset))))
+        
+        batch_informals = batch_samples['inFormalForm']
+        batch_targets = batch_samples['formalForm']
+        
+        # Build prompts for the whole batch
+        prompts = [
+            f"<start_of_turn>user\nمتن محاوره‌ای زیر را به متن رسمی تبدیل کن:\n{inf}<end_of_turn>\n<start_of_turn>model\n" 
+            for inf in batch_informals
+        ]
+        
+        # Tokenize the batch (with padding)
+        inputs = tokenizer(
+            prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True,
+            max_length=512
+        ).to("cuda")
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=128,       # Reduced from 256 (sentences are short)
+                use_cache=True,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id
+            )
+        
+        # Extract the generated tokens (remove the prompt part)
+        input_length = inputs.input_ids.shape[1]
+        generated_tokens = outputs[:, input_length:]
+        
+        # Decode the batch
+        predicted_formals = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        
+        # Store in dictionary
+        for inf, tgt, pred in zip(batch_informals, batch_targets, predicted_formals):
+            eval_data["informal_text"].append(inf)
+            eval_data["target_formal_text"].append(tgt)
+            eval_data["predicted_formal_text"].append(pred.strip())
+            
+    df = pd.DataFrame(eval_data)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"✅ Evaluation dataset created and saved to '{csv_path}'!")
+    return df
+
+
+def calculate_metrics(evaluation_df):
+    """
+    This function takes the evaluation DataFrame and calculates 
+    BLEU, METEOR, chrF, and BERTScore metrics.
+    """
+    print("\n--- Calculating Metrics ---")
+    
+    # Extract reference (Ground Truth) and prediction lists
+    predictions = evaluation_df["predicted_formal_text"].tolist()
+    references = evaluation_df["target_formal_text"].tolist()
+    
+    results = {}
+    
+    # 1. Calculate BLEU
+    bleu_metric = evaluate.load("bleu")
+    bleu_results = bleu_metric.compute(predictions=predictions, references=references)
+    results['BLEU'] = bleu_results['bleu'] * 100 # Convert to percentage for better readability
+    
+    # 2. Calculate METEOR
+    meteor_metric = evaluate.load("meteor")
+    meteor_results = meteor_metric.compute(predictions=predictions, references=references)
+    results['METEOR'] = meteor_results['meteor'] * 100
+    
+    # 3. Calculate chrF
+    chrf_metric = evaluate.load("chrf")
+    chrf_results = chrf_metric.compute(predictions=predictions, references=references)
+    results['chrF'] = chrf_results['score']
+    
+    # 4. Calculate BERTScore (using multilingual model for Persian)
+    print("Calculating BERTScore (this might take a minute)...")
+    bertscore_metric = evaluate.load("bertscore")
+    bertscore_results = bertscore_metric.compute(
+        predictions=predictions, 
+        references=references, 
+        model_type="bert-base-multilingual-cased", # Appropriate model for Persian
+        lang="fa" # Persian language
+    )
+    # Average F1 score
+    results['BERTScore_F1'] = sum(bertscore_results['f1']) / len(bertscore_results['f1'])
+    
+    # Print results neatly
+    print("\n" + "="*40)
+    print("📊 FINAL EVALUATION RESULTS 📊")
+    print("="*40)
+    for metric, score in results.items():
+        print(f"{metric:15}: {score:.2f}")
+    print("="*40)
+    
+    return results
+
+
+
 if __name__ == "__main__":
     # ==================== CONFIGURATION ====================
     MODEL_NAME="unsloth/gemma-3-4b-it-unsloth-bnb-4bit" 
     DATASET_PATH = "data/dataset/trainset_40k_onlySent.xlsx"
+    FINAL_MODEL_PATH = "data/model/final_model" 
+
 
     # ==================== STEP 1: LOAD RAW DATA ====================
     # convert_dataset_to_json()
-    raw_dataset=loading_dataset(DATASET_PATH)
+    # raw_dataset=loading_dataset(DATASET_PATH)
     # dataset_first_look(raw_dataset)
 
     # ==================== STEP 2: PREPARE DATA ====================
-    cleaned_dataset =clean_dataset(raw_dataset)
-    train_dataset,valid_dataset=split_dataset(cleaned_dataset)
+    # cleaned_dataset =clean_dataset(raw_dataset)
+    # train_dataset,valid_dataset=split_dataset(cleaned_dataset)
+
 
     # ==================== STEP 3: LOAD MODEL ====================
-    base_model,base_tokenizer=load_model_and_tokenizer(MODEL_NAME)
+    # base_model,base_tokenizer=load_model_and_tokenizer(MODEL_NAME)
 
     # ==================== STEP 4: PRE-TRAIN ====================
-    train_dataset_formatted, formatted_tokenizer=prepare_dataset_for_training(train_dataset, base_tokenizer)
-    valid_dataset_formatted, _ = prepare_dataset_for_training(valid_dataset, base_tokenizer)
+    # train_dataset_formatted, formatted_tokenizer=prepare_dataset_for_training(train_dataset, base_tokenizer)
+    # valid_dataset_formatted, _ = prepare_dataset_for_training(valid_dataset, base_tokenizer)
+
+    
+    # valid_dataset_formatted = valid_dataset_formatted.shuffle(seed=42).select(range(2000))
 
     # ==================== STEP 5: TRAIN ====================
-    SFT_model,SFT_tokenizer=start_training(base_model, base_tokenizer, train_dataset_formatted, valid_dataset_formatted,)
+    # SFT_model,SFT_tokenizer=start_training(base_model, base_tokenizer, train_dataset_formatted, valid_dataset_formatted,)
+
+
+    # ==================== STEP 6: EVALUATION ====================
+
+    # ==================== STEP 1 & 2: LOAD & PREPARE RAW DATA ====================
+    raw_dataset = loading_dataset(DATASET_PATH)
+    cleaned_dataset = clean_dataset(raw_dataset)
+    train_dataset, valid_dataset = split_dataset(cleaned_dataset)
+
+    # ==================== STEP 3: EVALUATION ====================
+    print("\n1. Loading Fine-Tuned Model...")
+    
+    # (در اینجا مستقیماً مدل نهایی را لود می‌کنیم، نه مدل پایه)
+    SFT_model, SFT_tokenizer = FastLanguageModel.from_pretrained(
+        model_name=FINAL_MODEL_PATH,
+        max_seq_length=512,
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+    )
+    SFT_tokenizer = get_chat_template(SFT_tokenizer, chat_template="gemma-3")
+
+    # پاک کردن حافظه اضافی (برای اطمینان)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ==================== STEP 4: CREATE EVALUATION DATASET ====================
+    # نکته مهم: اینجا به جای SFT_tokenizer باید SFT_model پاس داده شود
+    # و دیتاست باید همان valid_dataset (خام) باشد، نه فرمت شده.
+    eval_df = create_evaluation_dataset(
+        model=SFT_model,             # <--- مدل اینجا قرار می‌گیرد (اشتباه قبلی رفع شد)
+        tokenizer=SFT_tokenizer, 
+        valid_dataset=valid_dataset, # <--- دیتاست خام اینجا قرار می‌گیرد
+        num_samples=2000
+    )
+    
+    # ==================== STEP 5: CALCULATE METRICS ====================
+    final_scores = calculate_metrics(eval_df)
+    
+    print("\n🎉 Evaluation process completed successfully!")
