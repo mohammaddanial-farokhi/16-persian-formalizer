@@ -1,28 +1,49 @@
-import unsloth
-import os
-os.environ["UNSLOTH_MOE_DISABLE_AUTOTUNE"] = "1"
+# =====================================================================
+# TABLE OF CONTENTS
+# =====================================================================
+# 1. IMPORTS & ENVIRONMENT SETUP
+# 2. DATA LOADING & ANALYSIS
+# 3. DATA PREPROCESSING (Clean & Split)
+# 4. MODEL LOADING & QLORA SETUP
+# 5. DATASET FORMATTING (Prompt Engineering)
+# 6. MODEL TRAINING (SFT)
+# 7. MODEL EVALUATION (Generation & Metrics)
+# 8. MAIN EXECUTION PIPELINE
+# =====================================================================
 
+# =====================================================================
+# 1. IMPORTS & ENVIRONMENT SETUP
+# =====================================================================
+import os
+# Set Unsloth env var before importing it
+os.environ["UNSLOTH_MOE_DISABLE_AUTOTUNE"] = "1" 
+
+import gc
 import random
-import pandas as pd
-import numpy as np
-from datasets import Dataset, load_dataset, DatasetDict
 from collections import Counter
 from pathlib import Path
-from transformers import  AutoTokenizer, AutoModelForCausalLM
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template,train_on_responses_only
-import torch
-from trl import SFTConfig,SFTTrainer
-from transformers.trainer_utils import get_last_checkpoint
-import gc
-import torch
-import unsloth
+
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
+import torch
+
+# Hugging Face & Evaluation
+from datasets import Dataset, load_dataset, DatasetDict
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.trainer_utils import get_last_checkpoint
 import evaluate
 
-# =====================================================
-# 1. DATA LOADING & ANALYSIS
-# =====================================================
+# Unsloth & TRL
+import unsloth
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template, train_on_responses_only
+from trl import SFTConfig, SFTTrainer
+
+
+# =====================================================================
+# 2. DATA LOADING & ANALYSIS
+# =====================================================================
 def loading_dataset(dataset_path):
     """
     Reads an Excel file and converts it directly to a Hugging Face DatasetDict.
@@ -77,7 +98,6 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
     # ---------- 3) Null / empty ----------
     print("\n[3] NULL / EMPTY VALUES")
     for col in data.column_names:
-        # Check for None, empty strings, or strings with just spaces
         n_empty = sum(1 for x in col_data[col] if x is None or len(str(x).strip()) == 0)
         pct = 100 * n_empty / len(data) if len(data) else 0
         status = "OK  " if n_empty == 0 else "WARN"
@@ -86,7 +106,6 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
     # ---------- 4) Unique values ----------
     print("\n[4] UNIQUE VALUES PER COLUMN")
     for col in data.column_names:
-        # Convert to string just in case to avoid unhashable types
         extracted_list = [str(x) for x in col_data[col]]
         n_unique = len(set(extracted_list))
         if n_unique <= 20:
@@ -96,7 +115,6 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
                 print(f"        * {val!r}: {count:,} ({pct:.1f}%)")
         else:
             print(f"    - {col}: {n_unique:,} unique values")
-            # Show the duplicate count for context
             n_dupes = len(extracted_list) - n_unique
             pct_dupes = 100 * n_dupes / len(data)
             print(f"        * (Note: {n_dupes:,} duplicated values [{pct_dupes:.2f}%])")
@@ -110,15 +128,9 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
         diff = len_formal - len_informal
         print(f"    - Mean Formal length:   {np.mean(len_formal):.1f} chars")
         print(f"    - Mean Informal length: {np.mean(len_informal):.1f} chars")
-        print(
-            f"    - Formal is longer in:  {(diff > 0).sum():,} rows ({(diff > 0).mean()*100:.1f}%)"
-        )
-        print(
-            f"    - Informal is longer in:{(diff < 0).sum():,} rows ({(diff < 0).mean()*100:.1f}%)"
-        )
-        print(
-            f"    - Equal length:         {(diff == 0).sum():,} rows ({(diff == 0).mean()*100:.1f}%)"
-        )
+        print(f"    - Formal is longer in:  {(diff > 0).sum():,} rows ({(diff > 0).mean()*100:.1f}%)")
+        print(f"    - Informal is longer in:{(diff < 0).sum():,} rows ({(diff < 0).mean()*100:.1f}%)")
+        print(f"    - Equal length:         {(diff == 0).sum():,} rows ({(diff == 0).mean()*100:.1f}%)")
 
     # ---------- 6) Text length distribution ----------
     print("\n[6] TEXT LENGTH DISTRIBUTION")
@@ -146,7 +158,6 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
 
     # ---------- 7) Duplicates ----------
     print("\n[7] DUPLICATES")
-    # Check exact duplicate pairs
     pairs = list(zip(col_data["formalForm"], col_data["inFormalForm"]))
     n_dupe_pairs = len(pairs) - len(set(pairs))
     print(f"    - exact duplicate row pairs: {n_dupe_pairs:,}")
@@ -164,12 +175,12 @@ def dataset_first_look(dataset, sample_size: int = 2, text_columns=None):
     print(f"\n{line}\nAnalysis finished.\n{line}")
 
 
-# =====================================================
-# 2. DATA PREPROCESS
-# =====================================================
+# =====================================================================
+# 3. DATA PREPROCESSING (Clean & Split)
+# =====================================================================
 def clean_dataset(dataset_dict):
     """
-    Takes a DatasetDict, removes exact duplicate rows from all splits,
+    Takes a DatasetDict, removes exact duplicate rows from all splits.
     """
     print("\n--- Removing Duplicates ---")
     
@@ -183,7 +194,6 @@ def clean_dataset(dataset_dict):
         
         df = split_data.to_pandas()
         initial_len = len(df)
-        
         df_cleaned = df.drop_duplicates()
         final_len = len(df_cleaned)
         
@@ -220,15 +230,15 @@ def split_dataset(dataset_dict, val_size=0.1, seed=42):
     
     return train_data, val_data
 
-# =====================================================
-# 3. MODEL LOADING & QLORA SETUP
-# =====================================================
+
+# =====================================================================
+# 4. MODEL LOADING & QLORA SETUP
+# =====================================================================
 def load_model_and_tokenizer(model_name, max_seq_length=512):
     """
     Loads a model using Unsloth for fast QLoRA fine-tuning.
     """
     print(f"Loading model with Unsloth: {model_name}")
-
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
@@ -238,15 +248,13 @@ def load_model_and_tokenizer(model_name, max_seq_length=512):
         local_files_only=True,            
     )
 
-
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-
     model = FastLanguageModel.get_peft_model(
         model,
-        r=16, # رنک LoRA
+        r=16, # LoRA rank
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=32,
         lora_dropout=0.0, 
@@ -263,9 +271,9 @@ def load_model_and_tokenizer(model_name, max_seq_length=512):
     return model, tokenizer
 
 
-# =====================================================
-# 4. MODEL PRE-TRAIN
-# =====================================================
+# =====================================================================
+# 5. DATASET FORMATTING (Prompt Engineering)
+# =====================================================================
 def prepare_dataset_for_training(dataset, tokenizer):
     """
     Formats the dataset into a conversation structure and applies the Gemma 3 chat template.
@@ -294,27 +302,24 @@ def prepare_dataset_for_training(dataset, tokenizer):
             
         return {"text": texts}
     
-
     formatted_dataset = dataset.map(format_prompts, batched=True)
     print("Dataset formatted successfully!")
     
     return formatted_dataset, tokenizer
 
 
-# =====================================================
-# 5. TRAIN
-# =====================================================
+# =====================================================================
+# 6. MODEL TRAINING (SFT)
+# =====================================================================
 def start_training(model, tokenizer, train_dataset, valid_dataset):
     print("\n--- Starting Fine-Tuning (Optimized with Unsloth) ---")
     
-    # 1. Define paths
     checkpoint_dir = "data/model/checkpoints"
     final_model_dir = "data/model/final_model"
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(final_model_dir, exist_ok=True)
 
-    # 2. Check for existing checkpoints
     last_checkpoint = None
     if os.path.exists(checkpoint_dir):
         last_checkpoint = get_last_checkpoint(checkpoint_dir)
@@ -324,35 +329,33 @@ def start_training(model, tokenizer, train_dataset, valid_dataset):
     else:
         print("No checkpoint found. Starting from scratch.")
 
-    # 3. Optimized configuration for RTX 4060 8GB + Unsloth
     training_args = SFTConfig(
         output_dir=checkpoint_dir,
         dataset_text_field="text",
-        max_seq_length=256,                 # Sentences are short, no need for a larger number
-        per_device_train_batch_size=2,      # Since we use train_on_responses_only, we can set batch size to 2 (change to 1 if OOM occurs)
-        gradient_accumulation_steps=5,      # Equivalent to batch size 8
-        per_device_eval_batch_size=1,       # <--- این خط را اضافه کنید (در هر لحظه 1 داده در ارزیابی)
-        eval_accumulation_steps=4,          # <--- برای انتقال تدریجی نتایج به رم
+        max_seq_length=256,                 
+        per_device_train_batch_size=2,      
+        gradient_accumulation_steps=5,      
+        per_device_eval_batch_size=1,       
+        eval_accumulation_steps=4,          
         warmup_steps=10,
         num_train_epochs=2,
         learning_rate=2e-4,
         fp16=False,
-        bf16=True,                          # RTX 4060 supports this
+        bf16=True,                          
         logging_steps=100,
         eval_strategy="steps",
         eval_steps=1500,
         save_strategy="steps",
         save_steps=500,
-        save_total_limit=3,                 # Exactly as requested: keep only 3 checkpoints
-        optim="adamw_8bit",                 # 8-bit optimizer to save memory
+        save_total_limit=3,                 
+        optim="adamw_8bit",                 
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=3407,
         report_to="none",
-        packing=False,                      # For this dataset, it's better to disable packing
+        packing=False,                      
     )
 
-    # 4. Create SFTTrainer
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -361,19 +364,15 @@ def start_training(model, tokenizer, train_dataset, valid_dataset):
         args=training_args,
     )
 
-    # 5. Unsloth magic: train only on responses
-    # This tells the model to only learn the text after <start_of_turn>model
     trainer = train_on_responses_only(
         trainer,
         instruction_part="<start_of_turn>user\n",
         response_part="<start_of_turn>model\n",
     )
 
-    # 6. Start training (with Resume capability)
     print("\nTraining started... Check your terminal for loss updates.")
     trainer.train(resume_from_checkpoint=last_checkpoint)
     
-    # 7. Save the final model
     print("\n--- Saving Final Model ---")
     model.save_pretrained(final_model_dir)
     tokenizer.save_pretrained(final_model_dir)
@@ -382,9 +381,9 @@ def start_training(model, tokenizer, train_dataset, valid_dataset):
     return model, tokenizer
 
 
-# =====================================================
-# 6. EVALUATION
-# =====================================================
+# =====================================================================
+# 7. MODEL EVALUATION (Generation & Metrics)
+# =====================================================================
 def create_evaluation_dataset(model, tokenizer, valid_dataset, num_samples=2000, batch_size=16):
     """
     Optimized function to generate predictions in batches for much faster inference.
@@ -399,7 +398,6 @@ def create_evaluation_dataset(model, tokenizer, valid_dataset, num_samples=2000,
     
     FastLanguageModel.for_inference(model)
     
-    # IMPORTANT: For batched generation, tokenizer must pad on the left
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -412,20 +410,17 @@ def create_evaluation_dataset(model, tokenizer, valid_dataset, num_samples=2000,
     
     subset = valid_dataset.select(range(min(num_samples, len(valid_dataset))))
     
-    # Process in batches
     for i in tqdm(range(0, len(subset), batch_size), desc="Processing batches"):
         batch_samples = subset.select(range(i, min(i + batch_size, len(subset))))
         
         batch_informals = batch_samples['inFormalForm']
         batch_targets = batch_samples['formalForm']
         
-        # Build prompts for the whole batch
         prompts = [
             f"<start_of_turn>user\nمتن محاوره‌ای زیر را به متن رسمی تبدیل کن:\n{inf}<end_of_turn>\n<start_of_turn>model\n" 
             for inf in batch_informals
         ]
         
-        # Tokenize the batch (with padding)
         inputs = tokenizer(
             prompts, 
             return_tensors="pt", 
@@ -438,20 +433,17 @@ def create_evaluation_dataset(model, tokenizer, valid_dataset, num_samples=2000,
             outputs = model.generate(
                 input_ids=inputs.input_ids,
                 attention_mask=inputs.attention_mask,
-                max_new_tokens=128,       # Reduced from 256 (sentences are short)
+                max_new_tokens=128,       
                 use_cache=True,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id
             )
         
-        # Extract the generated tokens (remove the prompt part)
         input_length = inputs.input_ids.shape[1]
         generated_tokens = outputs[:, input_length:]
         
-        # Decode the batch
         predicted_formals = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         
-        # Store in dictionary
         for inf, tgt, pred in zip(batch_informals, batch_targets, predicted_formals):
             eval_data["informal_text"].append(inf)
             eval_data["target_formal_text"].append(tgt)
@@ -471,40 +463,33 @@ def calculate_metrics(evaluation_df):
     """
     print("\n--- Calculating Metrics ---")
     
-    # Extract reference (Ground Truth) and prediction lists
     predictions = evaluation_df["predicted_formal_text"].tolist()
     references = evaluation_df["target_formal_text"].tolist()
     
     results = {}
     
-    # 1. Calculate BLEU
     bleu_metric = evaluate.load("bleu")
     bleu_results = bleu_metric.compute(predictions=predictions, references=references)
-    results['BLEU'] = bleu_results['bleu'] * 100 # Convert to percentage for better readability
+    results['BLEU'] = bleu_results['bleu'] * 100 
     
-    # 2. Calculate METEOR
     meteor_metric = evaluate.load("meteor")
     meteor_results = meteor_metric.compute(predictions=predictions, references=references)
     results['METEOR'] = meteor_results['meteor'] * 100
     
-    # 3. Calculate chrF
     chrf_metric = evaluate.load("chrf")
     chrf_results = chrf_metric.compute(predictions=predictions, references=references)
     results['chrF'] = chrf_results['score']
     
-    # 4. Calculate BERTScore (using multilingual model for Persian)
     print("Calculating BERTScore (this might take a minute)...")
     bertscore_metric = evaluate.load("bertscore")
     bertscore_results = bertscore_metric.compute(
         predictions=predictions, 
         references=references, 
-        model_type="bert-base-multilingual-cased", # Appropriate model for Persian
-        lang="fa" # Persian language
+        model_type="bert-base-multilingual-cased", 
+        lang="fa" 
     )
-    # Average F1 score
     results['BERTScore_F1'] = sum(bertscore_results['f1']) / len(bertscore_results['f1'])
     
-    # Print results neatly
     print("\n" + "="*40)
     print("📊 FINAL EVALUATION RESULTS 📊")
     print("="*40)
@@ -515,49 +500,41 @@ def calculate_metrics(evaluation_df):
     return results
 
 
-
+# =====================================================================
+# 8. MAIN EXECUTION PIPELINE
+# =====================================================================
 if __name__ == "__main__":
+    
     # ==================== CONFIGURATION ====================
-    MODEL_NAME="unsloth/gemma-3-4b-it-unsloth-bnb-4bit" 
+    MODEL_NAME = "unsloth/gemma-3-4b-it-unsloth-bnb-4bit" 
     DATASET_PATH = "data/dataset/trainset_40k_onlySent.xlsx"
     FINAL_MODEL_PATH = "data/model/final_model" 
 
-
-    # ==================== STEP 1: LOAD RAW DATA ====================
-    # convert_dataset_to_json()
-    # raw_dataset=loading_dataset(DATASET_PATH)
-    # dataset_first_look(raw_dataset)
-
-    # ==================== STEP 2: PREPARE DATA ====================
-    # cleaned_dataset =clean_dataset(raw_dataset)
-    # train_dataset,valid_dataset=split_dataset(cleaned_dataset)
-
-
-    # ==================== STEP 3: LOAD MODEL ====================
-    # base_model,base_tokenizer=load_model_and_tokenizer(MODEL_NAME)
-
-    # ==================== STEP 4: PRE-TRAIN ====================
-    # train_dataset_formatted, formatted_tokenizer=prepare_dataset_for_training(train_dataset, base_tokenizer)
-    # valid_dataset_formatted, _ = prepare_dataset_for_training(valid_dataset, base_tokenizer)
-
-    
-    # valid_dataset_formatted = valid_dataset_formatted.shuffle(seed=42).select(range(2000))
-
-    # ==================== STEP 5: TRAIN ====================
-    # SFT_model,SFT_tokenizer=start_training(base_model, base_tokenizer, train_dataset_formatted, valid_dataset_formatted,)
-
-
-    # ==================== STEP 6: EVALUATION ====================
-
-    # ==================== STEP 1 & 2: LOAD & PREPARE RAW DATA ====================
+    # ==================== PHASE 1: DATA PREPARATION ====================
+    print("\n>>> PHASE 1: DATA PREPARATION")
     raw_dataset = loading_dataset(DATASET_PATH)
+    # dataset_first_look(raw_dataset) # Uncomment for initial analysis
+    
     cleaned_dataset = clean_dataset(raw_dataset)
     train_dataset, valid_dataset = split_dataset(cleaned_dataset)
 
-    # ==================== STEP 3: EVALUATION ====================
-    print("\n1. Loading Fine-Tuned Model...")
+
+    # ==================== PHASE 2: MODEL TRAINING ====================
+    # (Currently commented out to run Evaluation only)
     
-    # (در اینجا مستقیماً مدل نهایی را لود می‌کنیم، نه مدل پایه)
+    # print("\n>>> PHASE 2: MODEL TRAINING")
+    # base_model, base_tokenizer = load_model_and_tokenizer(MODEL_NAME)
+    # train_dataset_formatted, formatted_tokenizer = prepare_dataset_for_training(train_dataset, base_tokenizer)
+    # valid_dataset_formatted, _ = prepare_dataset_for_training(valid_dataset, base_tokenizer)
+    # valid_dataset_formatted = valid_dataset_formatted.shuffle(seed=42).select(range(2000))
+    # SFT_model, SFT_tokenizer = start_training(base_model, base_tokenizer, train_dataset_formatted, valid_dataset_formatted)
+
+
+    # ==================== PHASE 3: MODEL EVALUATION ====================
+    print("\n>>> PHASE 3: MODEL EVALUATION")
+    
+    # 1. Load the fine-tuned model
+    print("\nLoading Fine-Tuned Model...")
     SFT_model, SFT_tokenizer = FastLanguageModel.from_pretrained(
         model_name=FINAL_MODEL_PATH,
         max_seq_length=512,
@@ -565,22 +542,20 @@ if __name__ == "__main__":
         load_in_4bit=True,
     )
     SFT_tokenizer = get_chat_template(SFT_tokenizer, chat_template="gemma-3")
-
-    # پاک کردن حافظه اضافی (برای اطمینان)
+    
+    # Clear memory to avoid OOM
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ==================== STEP 4: CREATE EVALUATION DATASET ====================
-    # نکته مهم: اینجا به جای SFT_tokenizer باید SFT_model پاس داده شود
-    # و دیتاست باید همان valid_dataset (خام) باشد، نه فرمت شده.
+    # 2. Create/load evaluation dataset
     eval_df = create_evaluation_dataset(
-        model=SFT_model,             # <--- مدل اینجا قرار می‌گیرد (اشتباه قبلی رفع شد)
+        model=SFT_model,            
         tokenizer=SFT_tokenizer, 
-        valid_dataset=valid_dataset, # <--- دیتاست خام اینجا قرار می‌گیرد
+        valid_dataset=valid_dataset, # Using the raw validation dataset
         num_samples=2000
     )
     
-    # ==================== STEP 5: CALCULATE METRICS ====================
+    # 3. Calculate metrics
     final_scores = calculate_metrics(eval_df)
     
-    print("\n🎉 Evaluation process completed successfully!")
+    print("\n✅ Evaluation process completed successfully!")
